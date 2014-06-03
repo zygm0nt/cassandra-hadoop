@@ -24,11 +24,18 @@ import java.nio.ByteBuffer;
 import java.util.*;
 
 import com.google.common.collect.*;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.Column;
+import org.apache.cassandra.db.marshal.CompositeType;
+import org.apache.cassandra.hadoop.*;
+import org.apache.cassandra.hadoop.ColumnFamilyInputFormat;
+import org.apache.cassandra.hadoop.ConfigHelper;
+import org.apache.cassandra.thrift.ConsistencyLevel;
+import org.apache.cassandra.thrift.CounterColumn;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.db.IColumn;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.TypeParser;
 import org.apache.cassandra.dht.IPartitioner;
@@ -43,16 +50,16 @@ import org.apache.hadoop.mapreduce.TaskAttemptContext;
 import org.apache.thrift.TException;
 import org.apache.thrift.transport.TTransport;
 
-public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap<ByteBuffer, IColumn>>
-    implements org.apache.hadoop.mapred.RecordReader<ByteBuffer, SortedMap<ByteBuffer, IColumn>>
+public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap<ByteBuffer, Column>>
+    implements org.apache.hadoop.mapred.RecordReader<ByteBuffer, SortedMap<ByteBuffer, Column>>
 {
     private static final Logger logger = LoggerFactory.getLogger(ColumnFamilyRecordReader.class);
 
     public static final int CASSANDRA_HADOOP_MAX_KEY_SIZE_DEFAULT = 8192;
 
-    private ColumnFamilySplit split;
+    private org.apache.cassandra.hadoop.ColumnFamilySplit split;
     private RowIterator iter;
-    private Pair<ByteBuffer, SortedMap<ByteBuffer, IColumn>> currentRow;
+    private Pair<ByteBuffer, SortedMap<ByteBuffer, org.apache.cassandra.db.Column>> currentRow;
     private SlicePredicate predicate;
     private boolean isEmptyPredicate;
     private int totalRowCount; // total number of rows to fetch
@@ -91,7 +98,7 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
         return currentRow.left;
     }
 
-    public SortedMap<ByteBuffer, IColumn> getCurrentValue()
+    public SortedMap<ByteBuffer, org.apache.cassandra.db.Column> getCurrentValue()
     {
         return currentRow.right;
     }
@@ -130,20 +137,23 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
 
     public void initialize(InputSplit split, TaskAttemptContext context) throws IOException
     {
-        this.split = (ColumnFamilySplit) split;
+        this.split = (org.apache.cassandra.hadoop.ColumnFamilySplit) split;
         Configuration conf = context.getConfiguration();
-        KeyRange jobRange = ConfigHelper.getInputKeyRange(conf);
+        KeyRange jobRange = org.apache.cassandra.hadoop.ConfigHelper.getInputKeyRange(conf);
         filter = jobRange == null ? null : jobRange.row_filter;
-        predicate = ConfigHelper.getInputSlicePredicate(conf);
-        boolean widerows = ConfigHelper.getInputIsWide(conf);
+        predicate = org.apache.cassandra.hadoop.ConfigHelper.getInputSlicePredicate(conf);
+        boolean widerows = org.apache.cassandra.hadoop.ConfigHelper.getInputIsWide(conf);
         isEmptyPredicate = isEmptyPredicate(predicate);
         totalRowCount = (this.split.getLength() < Long.MAX_VALUE)
                 ? (int) this.split.getLength()
-                : ConfigHelper.getInputSplitSize(conf);
-        batchSize = ConfigHelper.getRangeBatchSize(conf);
-        cfName = ConfigHelper.getInputColumnFamily(conf);
-        consistencyLevel = ConsistencyLevel.valueOf(ConfigHelper.getReadConsistencyLevel(conf));
-        keyspace = ConfigHelper.getInputKeyspace(conf);
+                : org.apache.cassandra.hadoop.ConfigHelper.getInputSplitSize(conf);
+        batchSize = org.apache.cassandra.hadoop.ConfigHelper.getRangeBatchSize(conf);
+        cfName = org.apache.cassandra.hadoop.ConfigHelper.getInputColumnFamily(conf);
+        consistencyLevel = ConsistencyLevel.valueOf(org.apache.cassandra.hadoop.ConfigHelper.getReadConsistencyLevel(conf));
+        keyspace = org.apache.cassandra.hadoop.ConfigHelper.getInputKeyspace(conf);
+
+        if (batchSize < 2)
+            throw new IllegalArgumentException("Minimum batchSize is 2.  Suggested batchSize is 100 or more");
 
         try
         {
@@ -206,33 +216,36 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
         return split.getLocations()[0];
     }
 
-    private abstract class RowIterator extends AbstractIterator<Pair<ByteBuffer, SortedMap<ByteBuffer, IColumn>>>
+    private abstract class RowIterator extends AbstractIterator<Pair<ByteBuffer, SortedMap<ByteBuffer, org.apache.cassandra.db.Column>>>
     {
         protected List<KeySlice> rows;
         protected int totalRead = 0;
+        protected final boolean isSuper;
         protected final AbstractType<?> comparator;
         protected final AbstractType<?> subComparator;
         protected final IPartitioner partitioner;
 
         private RowIterator()
         {
+            CfDef cfDef = new CfDef();
             try
             {
                 partitioner = FBUtilities.newPartitioner(client.describe_partitioner());
                 // get CF meta data
                 String query = "SELECT comparator," +
-                               "       subcomparator " +
-                               "FROM system.schema_columnfamilies " +
-                               "WHERE keyspace_name = '%s' " +
-                               "  AND columnfamily_name = '%s' ";
+                        "       subcomparator," +
+                        "       type " +
+                        "FROM system.schema_columnfamilies " +
+                        "WHERE keyspace_name = '%s' " +
+                        "  AND columnfamily_name = '%s' ";
 
                 CqlResult result = client.execute_cql3_query(
-                                        ByteBufferUtil.bytes(String.format(query, keyspace, cfName)),
-                                        Compression.NONE,
-                                        ConsistencyLevel.ONE);
+                        ByteBufferUtil.bytes(String.format(query, keyspace, cfName)),
+                        Compression.NONE,
+                        ConsistencyLevel.ONE);
 
                 Iterator<CqlRow> iteraRow = result.rows.iterator();
-                CfDef cfDef = new CfDef();
+
                 if (iteraRow.hasNext())
                 {
                     CqlRow cqlRow = iteraRow.next();
@@ -240,6 +253,10 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
                     ByteBuffer subComparator = cqlRow.columns.get(1).value;
                     if (subComparator != null)
                         cfDef.subcomparator_type = ByteBufferUtil.string(subComparator);
+
+                    ByteBuffer type = cqlRow.columns.get(2).value;
+                    if (type != null)
+                        cfDef.column_type = ByteBufferUtil.string(type);
                 }
 
                 comparator = TypeParser.parse(cfDef.comparator_type);
@@ -257,6 +274,7 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
             {
                 throw new RuntimeException("unable to load keyspace " + keyspace, e);
             }
+            isSuper = "Super".equalsIgnoreCase(cfDef.column_type);
         }
 
         /**
@@ -267,46 +285,50 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
             return totalRead;
         }
 
-        protected IColumn unthriftify(ColumnOrSuperColumn cosc)
+        protected List<org.apache.cassandra.db.Column> unthriftify(ColumnOrSuperColumn cosc)
         {
             if (cosc.counter_column != null)
-                return unthriftifyCounter(cosc.counter_column);
+                return Collections.<org.apache.cassandra.db.Column>singletonList(unthriftifyCounter(cosc.counter_column));
             if (cosc.counter_super_column != null)
                 return unthriftifySuperCounter(cosc.counter_super_column);
             if (cosc.super_column != null)
                 return unthriftifySuper(cosc.super_column);
             assert cosc.column != null;
-            return unthriftifySimple(cosc.column);
+            return Collections.<org.apache.cassandra.db.Column>singletonList(unthriftifySimple(cosc.column));
         }
 
-        private IColumn unthriftifySuper(SuperColumn super_column)
+        private List<org.apache.cassandra.db.Column> unthriftifySuper(SuperColumn super_column)
         {
-            org.apache.cassandra.db.SuperColumn sc = new org.apache.cassandra.db.SuperColumn(super_column.name, subComparator);
-            for (Column column : super_column.columns)
+            List<org.apache.cassandra.db.Column> columns = new ArrayList<org.apache.cassandra.db.Column>(super_column.columns.size());
+            for (org.apache.cassandra.thrift.Column column : super_column.columns)
             {
-                sc.addColumn(unthriftifySimple(column));
+                org.apache.cassandra.db.Column c = unthriftifySimple(column);
+                columns.add(c.withUpdatedName(CompositeType.build(super_column.name, c.name())));
             }
-            return sc;
+            return columns;
         }
 
-        protected IColumn unthriftifySimple(Column column)
+        protected org.apache.cassandra.db.Column unthriftifySimple(org.apache.cassandra.thrift.Column column)
         {
             return new org.apache.cassandra.db.Column(column.name, column.value, column.timestamp);
         }
 
-        private IColumn unthriftifyCounter(CounterColumn column)
+        private org.apache.cassandra.db.Column unthriftifyCounter(CounterColumn column)
         {
-            //CounterColumns read the counterID from the System table, so need the StorageService running and access
+            //CounterColumns read the counterID from the System keyspace, so need the StorageService running and access
             //to cassandra.yaml. To avoid a Hadoop needing access to yaml return a regular Column.
             return new org.apache.cassandra.db.Column(column.name, ByteBufferUtil.bytes(column.value), 0);
         }
 
-        private IColumn unthriftifySuperCounter(CounterSuperColumn superColumn)
+        private List<org.apache.cassandra.db.Column> unthriftifySuperCounter(CounterSuperColumn super_column)
         {
-            org.apache.cassandra.db.SuperColumn sc = new org.apache.cassandra.db.SuperColumn(superColumn.name, subComparator);
-            for (CounterColumn column : superColumn.columns)
-                sc.addColumn(unthriftifyCounter(column));
-            return sc;
+            List<org.apache.cassandra.db.Column> columns = new ArrayList<org.apache.cassandra.db.Column>(super_column.columns.size());
+            for (CounterColumn column : super_column.columns)
+            {
+                org.apache.cassandra.db.Column c = unthriftifyCounter(column);
+                columns.add(c.withUpdatedName(CompositeType.build(super_column.name, c.name())));
+            }
+            return columns;
         }
     }
 
@@ -338,9 +360,9 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
             }
 
             KeyRange keyRange = new KeyRange(batchSize)
-                                .setStart_token(startToken)
-                                .setEnd_token(split.getEndToken())
-                                .setRow_filter(filter);
+                    .setStart_token(startToken)
+                    .setEnd_token(split.getEndToken())
+                    .setRow_filter(filter);
             try
             {
                 rows = client.get_range_slices(new ColumnParent(cfName), predicate, keyRange, consistencyLevel);
@@ -385,7 +407,7 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
             }
         }
 
-        protected Pair<ByteBuffer, SortedMap<ByteBuffer, IColumn>> computeNext()
+        protected Pair<ByteBuffer, SortedMap<ByteBuffer, org.apache.cassandra.db.Column>> computeNext()
         {
             maybeInit();
             if (rows == null)
@@ -393,11 +415,12 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
 
             totalRead++;
             KeySlice ks = rows.get(i++);
-            SortedMap<ByteBuffer, IColumn> map = new TreeMap<ByteBuffer, IColumn>(comparator);
+            SortedMap<ByteBuffer, org.apache.cassandra.db.Column> map = new TreeMap<ByteBuffer, org.apache.cassandra.db.Column>(comparator);
             for (ColumnOrSuperColumn cosc : ks.columns)
             {
-                IColumn column = unthriftify(cosc);
-                map.put(column.name(), column);
+                List<org.apache.cassandra.db.Column> columns = unthriftify(cosc);
+                for (org.apache.cassandra.db.Column column : columns)
+                    map.put(column.name(), column);
             }
             return Pair.create(ks.key, map);
         }
@@ -405,7 +428,7 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
 
     private class WideRowIterator extends RowIterator
     {
-        private PeekingIterator<Pair<ByteBuffer, SortedMap<ByteBuffer, IColumn>>> wideColumns;
+        private PeekingIterator<Pair<ByteBuffer, SortedMap<ByteBuffer, org.apache.cassandra.db.Column>>> wideColumns;
         private ByteBuffer lastColumn = ByteBufferUtil.EMPTY_BYTE_BUFFER;
         private ByteBuffer lastCountedKey = ByteBufferUtil.EMPTY_BYTE_BUFFER;
 
@@ -419,18 +442,18 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
             {
                 String startToken = split.getStartToken();
                 keyRange = new KeyRange(batchSize)
-                          .setStart_token(startToken)
-                          .setEnd_token(split.getEndToken())
-                          .setRow_filter(filter);
+                        .setStart_token(startToken)
+                        .setEnd_token(split.getEndToken())
+                        .setRow_filter(filter);
             }
             else
             {
                 KeySlice lastRow = Iterables.getLast(rows);
                 logger.debug("Starting with last-seen row {}", lastRow.key);
                 keyRange = new KeyRange(batchSize)
-                          .setStart_key(lastRow.key)
-                          .setEnd_token(split.getEndToken())
-                          .setRow_filter(filter);
+                        .setStart_key(lastRow.key)
+                        .setEnd_token(split.getEndToken())
+                        .setRow_filter(filter);
             }
 
             try
@@ -440,7 +463,7 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
                 for (KeySlice row : rows)
                     n += row.columns.size();
                 logger.debug("read {} columns in {} rows for {} starting with {}",
-                             new Object[]{ n, rows.size(), keyRange, lastColumn });
+                        new Object[]{ n, rows.size(), keyRange, lastColumn });
 
                 wideColumns = Iterators.peekingIterator(new WideColumnIterator(rows));
                 if (wideColumns.hasNext() && wideColumns.peek().right.keySet().iterator().next().equals(lastColumn))
@@ -454,13 +477,13 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
             }
         }
 
-        protected Pair<ByteBuffer, SortedMap<ByteBuffer, IColumn>> computeNext()
+        protected Pair<ByteBuffer, SortedMap<ByteBuffer, org.apache.cassandra.db.Column>> computeNext()
         {
             maybeInit();
             if (rows == null)
                 return endOfData();
 
-            Pair<ByteBuffer, SortedMap<ByteBuffer, IColumn>> next = wideColumns.next();
+            Pair<ByteBuffer, SortedMap<ByteBuffer, org.apache.cassandra.db.Column>> next = wideColumns.next();
             lastColumn = next.right.values().iterator().next().name().duplicate();
 
             maybeIncreaseRowCounter(next);
@@ -472,7 +495,7 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
          * Increases the row counter only if we really moved to the next row.
          * @param next just fetched row slice
          */
-        private void maybeIncreaseRowCounter(Pair<ByteBuffer, SortedMap<ByteBuffer, IColumn>> next)
+        private void maybeIncreaseRowCounter(Pair<ByteBuffer, SortedMap<ByteBuffer, org.apache.cassandra.db.Column>> next)
         {
             ByteBuffer currentKey = next.left;
             if (!currentKey.equals(lastCountedKey))
@@ -482,7 +505,7 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
             }
         }
 
-        private class WideColumnIterator extends AbstractIterator<Pair<ByteBuffer, SortedMap<ByteBuffer, IColumn>>>
+        private class WideColumnIterator extends AbstractIterator<Pair<ByteBuffer, SortedMap<ByteBuffer, org.apache.cassandra.db.Column>>>
         {
             private final Iterator<KeySlice> rows;
             private Iterator<ColumnOrSuperColumn> columns;
@@ -503,16 +526,27 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
                 columns = currentRow.columns.iterator();
             }
 
-            protected Pair<ByteBuffer, SortedMap<ByteBuffer, IColumn>> computeNext()
+            protected Pair<ByteBuffer, SortedMap<ByteBuffer, org.apache.cassandra.db.Column>> computeNext()
             {
                 while (true)
                 {
                     if (columns.hasNext())
                     {
                         ColumnOrSuperColumn cosc = columns.next();
-                        IColumn column = unthriftify(cosc);
-                        ImmutableSortedMap<ByteBuffer, IColumn> map = ImmutableSortedMap.of(column.name(), column);
-                        return Pair.<ByteBuffer, SortedMap<ByteBuffer, IColumn>>create(currentRow.key, map);
+                        SortedMap<ByteBuffer, org.apache.cassandra.db.Column> map;
+                        List<org.apache.cassandra.db.Column> columns = unthriftify(cosc);
+                        if (columns.size() == 1)
+                        {
+                            map = ImmutableSortedMap.of(columns.get(0).name(), columns.get(0));
+                        }
+                        else
+                        {
+                            assert isSuper;
+                            map = new TreeMap<ByteBuffer, org.apache.cassandra.db.Column>(CompositeType.getInstance(comparator, subComparator));
+                            for (org.apache.cassandra.db.Column column : columns)
+                                map.put(column.name(), column);
+                        }
+                        return Pair.<ByteBuffer, SortedMap<ByteBuffer, org.apache.cassandra.db.Column>>create(currentRow.key, map);
                     }
 
                     if (!rows.hasNext())
@@ -529,7 +563,7 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
     // to the old. Thus, expect a small performance hit.
     // And obviously this wouldn't work for wide rows. But since ColumnFamilyInputFormat
     // and ColumnFamilyRecordReader don't support them, it should be fine for now.
-    public boolean next(ByteBuffer key, SortedMap<ByteBuffer, IColumn> value) throws IOException
+    public boolean next(ByteBuffer key, SortedMap<ByteBuffer, org.apache.cassandra.db.Column> value) throws IOException
     {
         if (this.nextKeyValue())
         {
@@ -550,9 +584,9 @@ public class ColumnFamilyRecordReader extends RecordReader<ByteBuffer, SortedMap
         return ByteBuffer.wrap(new byte[this.keyBufferSize]);
     }
 
-    public SortedMap<ByteBuffer, IColumn> createValue()
+    public SortedMap<ByteBuffer, org.apache.cassandra.db.Column> createValue()
     {
-        return new TreeMap<ByteBuffer, IColumn>();
+        return new TreeMap<ByteBuffer, org.apache.cassandra.db.Column>();
     }
 
     public long getPos() throws IOException

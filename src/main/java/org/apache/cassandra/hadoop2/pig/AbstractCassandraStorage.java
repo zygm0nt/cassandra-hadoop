@@ -33,10 +33,11 @@ import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.cql3.CFDefinition;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.Column;
-import org.apache.cassandra.db.IColumn;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.db.marshal.AbstractCompositeType.CompositeComponent;
+import org.apache.cassandra.hadoop.*;
 import org.apache.cassandra.hadoop2.*;
+import org.apache.cassandra.hadoop2.ConfigHelper;
 import org.apache.cassandra.thrift.*;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
@@ -53,6 +54,7 @@ import org.apache.pig.impl.util.UDFContext;
 import org.apache.thrift.TDeserializer;
 import org.apache.thrift.TException;
 import org.apache.thrift.TSerializer;
+import org.apache.thrift.protocol.TBinaryProtocol;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -98,6 +100,8 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
     protected int splitSize = 64 * 1024;
     protected String partitionerClass;
     protected boolean usePartitionFilter = false;
+    protected String initHostAddress;
+    protected String rpcPort;
 
     public AbstractCassandraStorage()
     {
@@ -116,39 +120,34 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
     }
 
     /** convert a column to a tuple */
-    protected Tuple columnToTuple(IColumn col, CfDef cfDef, AbstractType comparator) throws IOException
+    protected Tuple columnToTuple(Column col, CfInfo cfInfo, AbstractType comparator) throws IOException
     {
+        CfDef cfDef = cfInfo.cfDef;
         Tuple pair = TupleFactory.getInstance().newTuple(2);
 
         // name
         if(comparator instanceof AbstractCompositeType)
             setTupleValue(pair, 0, composeComposite((AbstractCompositeType)comparator,col.name()));
         else
-            setTupleValue(pair, 0, comparator.compose(col.name()));
+            setTupleValue(pair, 0, cassandraToObj(comparator, col.name()));
 
         // value
-        if (col instanceof Column)
+        Map<ByteBuffer,AbstractType> validators = getValidatorMap(cfDef);
+        ByteBuffer colName;
+        if (cfInfo.cql3Table && !cfInfo.compactCqlTable)
         {
-            // standard
-            Map<ByteBuffer,AbstractType> validators = getValidatorMap(cfDef);
-            if (validators.get(col.name()) == null)
-            {
-                Map<MarshallerType, AbstractType> marshallers = getDefaultMarshallers(cfDef);
-                setTupleValue(pair, 1, marshallers.get(MarshallerType.DEFAULT_VALIDATOR).compose(col.value()));
-            }
-            else
-                setTupleValue(pair, 1, validators.get(col.name()).compose(col.value()));
-            return pair;
+            ByteBuffer[] names = ((AbstractCompositeType) parseType(cfDef.comparator_type)).split(col.name());
+            colName = names[names.length-1];
         }
         else
+            colName = col.name();
+        if (validators.get(colName) == null)
         {
-            // super
-            ArrayList<Tuple> subcols = new ArrayList<Tuple>();
-            for (IColumn subcol : col.getSubColumns())
-                subcols.add(columnToTuple(subcol, cfDef, parseType(cfDef.getSubcomparator_type())));
-
-            pair.set(1, new DefaultDataBag(subcols));
+            Map<MarshallerType, AbstractType> marshallers = getDefaultMarshallers(cfDef);
+            setTupleValue(pair, 1, cassandraToObj(marshallers.get(MarshallerType.DEFAULT_VALIDATOR), col.value()));
         }
+        else
+            setTupleValue(pair, 1, cassandraToObj(validators.get(colName), col.value()));
         return pair;
     }
 
@@ -165,14 +164,6 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
            pair.set(position, DateType.instance.decompose((Date) value).getLong());
        else
            pair.set(position, value);
-    }
-
-    /** get the columnfamily definition for the signature */
-    protected CfDef getCfDef(String signature)
-    {
-        UDFContext context = UDFContext.getUDFContext();
-        Properties property = context.getUDFProperties(AbstractCassandraStorage.class);
-        return cfdefFromString(property.getProperty(signature));
     }
 
     /** construct a map to store the mashaller type to cassandra data type mapping */
@@ -477,7 +468,7 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
     }
 
     /** Methods to get the column family schema from Cassandra */
-    protected void initSchema(String signature)
+    protected void initSchema(String signature) throws IOException
     {
         Properties properties = UDFContext.getUDFContext().getUDFProperties(AbstractCassandraStorage.class);
 
@@ -486,7 +477,7 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
         {
             try
             {
-                Cassandra.Client client = ConfigHelper.getClientFromInputAddressList(conf);
+                Cassandra.Client client = org.apache.cassandra.hadoop.ConfigHelper.getClientFromInputAddressList(conf);
                 client.set_keyspace(keyspace);
 
                 if (username != null && password != null)
@@ -502,7 +493,7 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
                     catch (AuthenticationException e)
                     {
                         logger.error("Authentication exception: invalid username and/or password");
-                        throw new RuntimeException(e);
+                        throw new IOException(e);
                     }
                     catch (AuthorizationException e)
                     {
@@ -511,24 +502,28 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
                 }
 
                 // compose the CfDef for the columfamily
-                CfDef cfDef = getCfDef(client);
+                CfInfo cfInfo = getCfInfo(client);
 
-                if (cfDef != null)
-                    properties.setProperty(signature, cfdefToString(cfDef));
+                if (cfInfo.cfDef != null)
+                {
+                    StringBuilder sb = new StringBuilder();
+                    sb.append(cfInfo.compactCqlTable ? 1 : 0).append(cfInfo.cql3Table ? 1: 0).append(cfdefToString(cfInfo.cfDef));
+                    properties.setProperty(signature, sb.toString());
+                }
                 else
-                    throw new RuntimeException(String.format("Column family '%s' not found in keyspace '%s'",
-                                                             column_family,
-                                                             keyspace));
+                    throw new IOException(String.format("Column family '%s' not found in keyspace '%s'",
+                            column_family,
+                            keyspace));
             }
             catch (Exception e)
             {
-                throw new RuntimeException(e);
+                throw new IOException(e);
             }
         }
     }
 
     /** convert CfDef to string */
-    protected static String cfdefToString(CfDef cfDef)
+    protected static String cfdefToString(CfDef cfDef) throws IOException
     {
         assert cfDef != null;
         // this is so awful it's kind of cool!
@@ -539,12 +534,12 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
         }
         catch (TException e)
         {
-            throw new RuntimeException(e);
+            throw new IOException(e);
         }
     }
 
     /** convert string back to CfDef */
-    protected static CfDef cfdefFromString(String st)
+    protected static CfDef cfdefFromString(String st) throws IOException
     {
         assert st != null;
         TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
@@ -555,92 +550,13 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
         }
         catch (TException e)
         {
-            throw new RuntimeException(e);
+            throw new IOException(e);
         }
-        return cfDef;
-    }
-
-    /** return the CfDef for the column family */
-    protected CfDef getCfDef(Cassandra.Client client)
-            throws InvalidRequestException,
-                   UnavailableException,
-                   TimedOutException,
-                   SchemaDisagreementException,
-                   TException,
-                   CharacterCodingException,
-                   NotFoundException,
-                   org.apache.cassandra.exceptions.InvalidRequestException,
-                   ConfigurationException
-    {
-        // get CF meta data
-        String query = "SELECT type," +
-                       "       comparator," +
-                       "       subcomparator," +
-                       "       default_validator," +
-                       "       key_validator," +
-                       "       key_aliases," +
-                       "       key_alias " +
-                       "FROM system.schema_columnfamilies " +
-                       "WHERE keyspace_name = '%s' " +
-                       "  AND columnfamily_name = '%s' ";
-
-        CqlResult result = client.execute_cql3_query(
-                                ByteBufferUtil.bytes(String.format(query, keyspace, column_family)),
-                                Compression.NONE,
-                                ConsistencyLevel.ONE);
-
-        if (result == null || result.rows == null || result.rows.isEmpty())
-            return null;
-
-        Iterator<CqlRow> iteraRow = result.rows.iterator();
-        CfDef cfDef = new CfDef();
-        cfDef.keyspace = keyspace;
-        cfDef.name = column_family;
-        boolean cql3Table = false;
-        if (iteraRow.hasNext())
-        {
-            CqlRow cqlRow = iteraRow.next();
-
-            cfDef.column_type = ByteBufferUtil.string(cqlRow.columns.get(0).value);
-            cfDef.comparator_type = ByteBufferUtil.string(cqlRow.columns.get(1).value);
-            ByteBuffer subComparator = cqlRow.columns.get(2).value;
-            if (subComparator != null)
-                cfDef.subcomparator_type = ByteBufferUtil.string(subComparator);
-            cfDef.default_validation_class = ByteBufferUtil.string(cqlRow.columns.get(3).value);
-            cfDef.key_validation_class = ByteBufferUtil.string(cqlRow.columns.get(4).value);
-            List<String> keys = null;
-            if (cqlRow.columns.get(5).value != null)
-            {
-                String keyAliases = ByteBufferUtil.string(cqlRow.columns.get(5).value);
-                keys = FBUtilities.fromJsonList(keyAliases);
-                // classis thrift tables
-                if (keys.size() == 0 && cqlRow.columns.get(6).value == null)
-                {
-                    CFDefinition cfDefinition = getCfDefinition(keyspace, column_family, client);
-                    for (ColumnIdentifier column : cfDefinition.keys.keySet())
-                    {
-                        String key = column.toString();
-                        String type = cfDefinition.keys.get(column).type.toString();
-                        logger.debug("name: {}, type: {} ", key, type);
-                        keys.add(key);
-                    }
-                }
-                else
-                    cql3Table = true;
-            }
-            else
-            {
-                String keyAlias = ByteBufferUtil.string(cqlRow.columns.get(6).value);
-                keys = new ArrayList<String>(1);
-                keys.add(keyAlias);
-            }
-        }
-        cfDef.column_metadata = getColumnMetadata(client, cql3Table);
         return cfDef;
     }
 
     /** get a list of columns */
-    protected abstract List<ColumnDef> getColumnMetadata(Cassandra.Client client, boolean cql3Table)
+    protected abstract List<ColumnDef> getColumnMetadata(Cassandra.Client client)
             throws InvalidRequestException,
             UnavailableException,
             TimedOutException,
@@ -651,8 +567,9 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
             ConfigurationException,
             NotFoundException;
 
+
     /** get column meta data */
-    protected List<ColumnDef> getColumnMeta(Cassandra.Client client, boolean cassandraStorage)
+    protected List<ColumnDef> getColumnMeta(Cassandra.Client client, boolean cassandraStorage, boolean includeCompactValueColumn)
             throws InvalidRequestException,
             UnavailableException,
             TimedOutException,
@@ -664,22 +581,27 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
             NotFoundException
     {
         String query = "SELECT column_name, " +
-                       "       validator, " +
-                       "       index_type " +
-                       "FROM system.schema_columns " +
-                       "WHERE keyspace_name = '%s' " +
-                       "  AND columnfamily_name = '%s'";
+                "       validator, " +
+                "       index_type, " +
+                "       type " +
+                "FROM system.schema_columns " +
+                "WHERE keyspace_name = '%s' " +
+                "  AND columnfamily_name = '%s'";
 
         CqlResult result = client.execute_cql3_query(
-                                   ByteBufferUtil.bytes(String.format(query, keyspace, column_family)),
-                                   Compression.NONE,
-                                   ConsistencyLevel.ONE);
+                ByteBufferUtil.bytes(String.format(query, keyspace, column_family)),
+                Compression.NONE,
+                ConsistencyLevel.ONE);
 
         List<CqlRow> rows = result.rows;
         List<ColumnDef> columnDefs = new ArrayList<ColumnDef>();
-        if (!cassandraStorage && (rows == null || rows.isEmpty()))
+        if (rows == null || rows.isEmpty())
         {
-            // check classic thrift tables
+            // if CassandraStorage, just return the empty list
+            if (cassandraStorage)
+                return columnDefs;
+
+            // otherwise for CqlStorage, check metadata for classic thrift tables
             CFDefinition cfDefinition = getCfDefinition(keyspace, column_family, client);
             for (ColumnIdentifier column : cfDefinition.metadata.keySet())
             {
@@ -691,7 +613,9 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
                 cDef.validation_class = type;
                 columnDefs.add(cDef);
             }
-            if (columnDefs.size() == 0)
+            // we may not need to include the value column for compact tables as we
+            // could have already processed it as schema_columnfamilies.value_alias
+            if (columnDefs.size() == 0 && includeCompactValueColumn)
             {
                 String value = cfDefinition.value != null ? cfDefinition.value.toString() : null;
                 if ("value".equals(value))
@@ -704,14 +628,15 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
             }
             return columnDefs;
         }
-        else if (rows == null || rows.isEmpty())
-            return columnDefs;
 
         Iterator<CqlRow> iterator = rows.iterator();
         while (iterator.hasNext())
         {
             CqlRow row = iterator.next();
             ColumnDef cDef = new ColumnDef();
+            String type = ByteBufferUtil.string(row.getColumns().get(3).value);
+            if (!type.equals("regular"))
+                continue;
             cDef.setName(ByteBufferUtil.clone(row.getColumns().get(0).value));
             cDef.validation_class = ByteBufferUtil.string(row.getColumns().get(1).value);
             ByteBuffer indexType = row.getColumns().get(2).value;
@@ -883,8 +808,7 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
     }
 
     /** return partition keys */
-    public String[] getPartitionKeys(String location, Job job)
-    {
+    public String[] getPartitionKeys(String location, Job job) throws IOException {
         if (!usePartitionFilter)
             return null;
         List<ColumnDef> indexes = getIndexes();
@@ -897,9 +821,9 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
     }
 
     /** get a list of columns with defined index*/
-    protected List<ColumnDef> getIndexes()
+    protected List<ColumnDef> getIndexes() throws IOException
     {
-        CfDef cfdef = getCfDef(loadSignature);
+        CfDef cfdef = getCfInfo(loadSignature).cfDef;
         List<ColumnDef> indexes = new ArrayList<ColumnDef>();
         for (ColumnDef cdef : cfdef.column_metadata)
         {
@@ -909,9 +833,82 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
         return indexes;
     }
 
+    /** get the columnfamily definition for the signature */
+    protected CfInfo getCfInfo(String signature) throws IOException
+    {
+        UDFContext context = UDFContext.getUDFContext();
+        Properties property = context.getUDFProperties(AbstractCassandraStorage.class);
+        String prop = property.getProperty(signature);
+        CfInfo cfInfo = new CfInfo();
+        cfInfo.cfDef = cfdefFromString(prop.substring(2));
+        cfInfo.compactCqlTable = prop.charAt(0) == '1' ? true : false;
+        cfInfo.cql3Table = prop.charAt(1) == '1' ? true : false;
+        return cfInfo;
+    }
+
+    protected CfInfo getCfInfo(Cassandra.Client client)
+            throws InvalidRequestException,
+            UnavailableException,
+            TimedOutException,
+            SchemaDisagreementException,
+            TException,
+            NotFoundException,
+            org.apache.cassandra.exceptions.InvalidRequestException,
+            ConfigurationException,
+            IOException
+    {
+        // get CF meta data
+        String query = "SELECT type," +
+                "       comparator," +
+                "       subcomparator," +
+                "       default_validator," +
+                "       key_validator," +
+                "       key_aliases " +
+                "FROM system.schema_columnfamilies " +
+                "WHERE keyspace_name = '%s' " +
+                "  AND columnfamily_name = '%s' ";
+
+        CqlResult result = client.execute_cql3_query(
+                ByteBufferUtil.bytes(String.format(query, keyspace, column_family)),
+                Compression.NONE,
+                ConsistencyLevel.ONE);
+
+        if (result == null || result.rows == null || result.rows.isEmpty())
+            return null;
+
+        Iterator<CqlRow> iteraRow = result.rows.iterator();
+        CfDef cfDef = new CfDef();
+        cfDef.keyspace = keyspace;
+        cfDef.name = column_family;
+        boolean cql3Table = false;
+        if (iteraRow.hasNext())
+        {
+            CqlRow cqlRow = iteraRow.next();
+
+            cfDef.column_type = ByteBufferUtil.string(cqlRow.columns.get(0).value);
+            cfDef.comparator_type = ByteBufferUtil.string(cqlRow.columns.get(1).value);
+            ByteBuffer subComparator = cqlRow.columns.get(2).value;
+            if (subComparator != null)
+                cfDef.subcomparator_type = ByteBufferUtil.string(subComparator);
+            cfDef.default_validation_class = ByteBufferUtil.string(cqlRow.columns.get(3).value);
+            cfDef.key_validation_class = ByteBufferUtil.string(cqlRow.columns.get(4).value);
+            String keyAliases = ByteBufferUtil.string(cqlRow.columns.get(5).value);
+            if (FBUtilities.fromJsonList(keyAliases).size() > 0)
+                cql3Table = true;
+        }
+        cfDef.column_metadata = getColumnMetadata(client);
+        CfInfo cfInfo = new CfInfo();
+        cfInfo.cfDef = cfDef;
+        if (cql3Table && !(parseType(cfDef.comparator_type) instanceof AbstractCompositeType))
+            cfInfo.compactCqlTable = true;
+        if (cql3Table)
+            cfInfo.cql3Table = true;;
+        return cfInfo;
+    }
+
 
     /** get CFDefinition of a column family */
-    private CFDefinition getCfDefinition(String ks, String cf, Cassandra.Client client)
+    protected CFDefinition getCfDefinition(String ks, String cf, Cassandra.Client client)
             throws NotFoundException,
             InvalidRequestException,
             TException,
@@ -925,6 +922,21 @@ public abstract class AbstractCassandraStorage extends LoadFunc implements Store
                 return new CFDefinition(CFMetaData.fromThrift(cfDef));
         }
         return null;
+    }
+
+    protected Object cassandraToObj(AbstractType validator, ByteBuffer value)
+    {
+        if (validator instanceof DecimalType || validator instanceof InetAddressType)
+            return validator.getString(value);
+        else
+            return validator.compose(value);
+    }
+
+    protected class CfInfo
+    {
+        boolean compactCqlTable = false;
+        boolean cql3Table = false;
+        CfDef cfDef;
     }
 }
 

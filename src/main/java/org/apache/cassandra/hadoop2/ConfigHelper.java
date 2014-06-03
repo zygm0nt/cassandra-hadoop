@@ -567,7 +567,7 @@ public class ConfigHelper
     {
         try
         {
-            TTransport transport = getClientTransportFactory(conf).openTransport(host, port, conf);
+            TTransport transport = getClientTransportFactory(conf).openTransport(host, port);
             return new Cassandra.Client(new TBinaryProtocol(transport, true, true));
         }
         catch (Exception e)

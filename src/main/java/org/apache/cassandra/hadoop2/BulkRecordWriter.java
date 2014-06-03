@@ -23,9 +23,13 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.net.UnknownHostException;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.streaming.StreamState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -94,7 +98,7 @@ implements org.apache.hadoop.mapred.RecordWriter<ByteBuffer,List<Mutation>>
 
     BulkRecordWriter(Configuration conf) throws IOException
     {
-        Config.setLoadYaml(false);
+        Config.setClientMode(true);
         Config.setOutboundBindAny(true);
         this.conf = conf;
         DatabaseDescriptor.setStreamThroughputOutboundMegabitsPerSec(Integer.parseInt(conf.get(STREAM_THROTTLE_MBITS, "0")));
@@ -221,13 +225,16 @@ implements org.apache.hadoop.mapred.RecordWriter<ByteBuffer,List<Mutation>>
         if (writer != null)
         {
             writer.close();
-            SSTableLoader.LoaderFuture future = loader.stream();
+            Future<StreamState> future = loader.stream();
             while (true)
             {
                 try
                 {
                     future.get(1000, TimeUnit.MILLISECONDS);
                     break;
+                }
+                catch (ExecutionException te) {
+                    progress.progress();
                 }
                 catch (TimeoutException te)
                 {
@@ -238,19 +245,19 @@ implements org.apache.hadoop.mapred.RecordWriter<ByteBuffer,List<Mutation>>
                     throw new IOException(e);
                 }
             }
-            if (future.hadFailures())
+            if (loader.getFailedHosts().size() > 0)
             {
-                if (future.getFailedHosts().size() > maxFailures)
-                    throw new IOException("Too many hosts failed: " + future.getFailedHosts());
+                if (loader.getFailedHosts().size() > maxFailures)
+                    throw new IOException("Too many hosts failed: " + loader.getFailedHosts());
                 else
-                    logger.warn("Some hosts failed: " + future.getFailedHosts());
+                    logger.warn("Some hosts failed: " + loader.getFailedHosts());
             }
         }
     }
 
     static class ExternalClient extends SSTableLoader.Client
     {
-        private final Map<String, Set<String>> knownCfs = new HashMap<String, Set<String>>();
+        private final Map<String, Map<String, CFMetaData>> knownCfs = new HashMap<String, Map<String, CFMetaData>>();
         private final String hostlist;
         private final int rpcPort;
         private final String username;
@@ -316,9 +323,9 @@ implements org.apache.hadoop.mapred.RecordWriter<ByteBuffer,List<Mutation>>
 
                     for (KsDef ksDef : ksDefs)
                     {
-                        Set<String> cfs = new HashSet<String>();
+                        Map<String, CFMetaData> cfs = new HashMap<String, CFMetaData>(ksDef.cf_defs.size());
                         for (CfDef cfDef : ksDef.cf_defs)
-                            cfs.add(cfDef.name);
+                            cfs.put(cfDef.name, CFMetaData.fromThrift(cfDef));
                         knownCfs.put(ksDef.name, cfs);
                     }
                     break;
@@ -331,10 +338,10 @@ implements org.apache.hadoop.mapred.RecordWriter<ByteBuffer,List<Mutation>>
             }
         }
 
-        public boolean validateColumnFamily(String keyspace, String cfName)
+        public CFMetaData getCFMetaData(String keyspace, String cfName)
         {
-            Set<String> cfs = knownCfs.get(keyspace);
-            return cfs != null && cfs.contains(cfName);
+            Map<String, CFMetaData> cfs = knownCfs.get(keyspace);
+            return cfs != null ? cfs.get(cfName) : null;
         }
 
         private static Cassandra.Client createThriftClient(String host, int port) throws TTransportException
