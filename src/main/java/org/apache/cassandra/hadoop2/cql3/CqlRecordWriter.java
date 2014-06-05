@@ -104,7 +104,8 @@ final class CqlRecordWriter extends AbstractColumnFamilyRecordWriter<Map<String,
 
         try
         {
-            Cassandra.Client client = ConfigHelper.getClientFromOutputAddressList(conf);
+            Cassandra.Client client = CqlOutputFormat.createAuthenticatedClient(ConfigHelper.getOutputInitialAddress(conf),
+                    ConfigHelper.getOutputRpcPort(conf), conf);
             retrievePartitionKeyValidator(client);
             String cqlQuery = CqlConfigHelper.getOutputCql(conf).trim();
             if (cqlQuery.toLowerCase().startsWith("insert"))
